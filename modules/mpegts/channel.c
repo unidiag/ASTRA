@@ -610,69 +610,98 @@ static void on_pmt(void *arg, mpegts_psi_t *psi)
 
 
 /*
- * Build DVB service_descriptor (0x48).
- *
- * provider/name: UTF-8.
- * service_type: original DVB service type.
- *
- * Returns descriptor size, or 0 on error.
+ * Force service_provider = "CATV" in SDT service_descriptor (0x48).
+ * Keep original service_type, service_name and all other descriptors.
+ * Returns rewritten service entry size, or 0 on malformed/oversized input.
  */
-size_t make_service_descriptor(
-    uint8_t *dst,
-    size_t capacity,
-    uint8_t service_type,
-    const char *provider,
-    const char *name
-) {
-    if (!dst || !provider || !name)
+static size_t sdt_catv_item(uint8_t *dst, size_t capacity,
+                            const uint8_t *src, size_t src_len)
+{
+    static const uint8_t provider[] = { 'C', 'A', 'T', 'V' };
+    const size_t provider_len = sizeof(provider);
+
+    if(src_len < 5 || capacity < 5)
         return 0;
 
-    size_t provider_len = strlen(provider);
-    size_t name_len = strlen(name);
-
-    /*
-     * 0x15 marks UTF-8 in DVB text.
-     * Each DVB string includes this byte.
-     */
-    if (provider_len > 250 || name_len > 250)
+    const size_t descriptors_len = ((size_t)(src[3] & 0x0F) << 8) | src[4];
+    if(descriptors_len + 5 != src_len)
         return 0;
 
-    size_t p_len = provider_len + 1;
-    size_t n_len = name_len + 1;
+    memcpy(dst, src, 5);
+    size_t in = 5;
+    size_t out = 5;
+    bool found = false;
 
-    /*
-     * service_type: 1 byte
-     * provider length: 1 byte
-     * provider text: p_len
-     * name length: 1 byte
-     * name text: n_len
-     */
-    size_t payload_len = 3 + p_len + n_len;
-    size_t total_len = 2 + payload_len;
+    while(in < src_len)
+    {
+        if(src_len - in < 2)
+            return 0;
+        const size_t desc_len = (size_t)src[in + 1] + 2;
+        if(desc_len > src_len - in)
+            return 0;
 
-    if (payload_len > 255 || total_len > capacity)
+        if(src[in] == 0x48 && !found)
+        {
+            /* 0x48: tag, length, type, provider_len,
+             *       provider, service_name_len, service_name */
+            const uint8_t *d = src + in;
+            const size_t payload = d[1];
+            if(payload < 3)
+                return 0;
+            const size_t old_provider_len = d[3];
+            if(old_provider_len + 3 > payload)
+                return 0;
+            const size_t name_len_index = 4 + old_provider_len;
+            const size_t name_len = d[name_len_index];
+            if(3 + old_provider_len + name_len != payload)
+                return 0;
+
+            const size_t new_payload = 3 + provider_len + name_len;
+            const size_t new_desc_len = 2 + new_payload;
+            if(new_payload > 255 || new_desc_len > capacity - out)
+                return 0;
+
+            dst[out++] = 0x48;
+            dst[out++] = (uint8_t)new_payload;
+            dst[out++] = d[2]; /* preserve service_type */
+            dst[out++] = (uint8_t)provider_len;
+            memcpy(dst + out, provider, provider_len);
+            out += provider_len;
+            dst[out++] = (uint8_t)name_len;
+            memcpy(dst + out, d + name_len_index + 1, name_len);
+            out += name_len;
+            found = true;
+        }
+        else
+        {
+            if(desc_len > capacity - out)
+                return 0;
+            memcpy(dst + out, src + in, desc_len);
+            out += desc_len;
+        }
+        in += desc_len;
+    }
+
+    if(!found)
+    {
+        /* Service descriptor missing: add a minimal CATV entry. */
+        if(capacity - out < 9)
+            return 0;
+        dst[out++] = 0x48;
+        dst[out++] = 7;
+        dst[out++] = 0x01; /* default digital TV service type */
+        dst[out++] = (uint8_t)provider_len;
+        memcpy(dst + out, provider, provider_len);
+        out += provider_len;
+        dst[out++] = 0; /* unknown service name */
+    }
+
+    const size_t new_descriptors_len = out - 5;
+    if(new_descriptors_len > 0x0FFF)
         return 0;
-
-    size_t pos = 0;
-
-    dst[pos++] = 0x48;
-    dst[pos++] = (uint8_t)payload_len;
-
-    dst[pos++] = service_type;
-
-    dst[pos++] = (uint8_t)p_len;
-    dst[pos++] = 0x15;
-
-    memcpy(dst + pos, provider, provider_len);
-    pos += provider_len;
-
-    dst[pos++] = (uint8_t)n_len;
-    dst[pos++] = 0x15;
-
-    memcpy(dst + pos, name, name_len);
-    pos += name_len;
-
-    return pos;
+    dst[3] = (dst[3] & 0xF0) | ((new_descriptors_len >> 8) & 0x0F);
+    dst[4] = (uint8_t)new_descriptors_len;
+    return out;
 }
 
 static void on_sdt(void *arg, mpegts_psi_t *psi)
@@ -740,10 +769,19 @@ static void on_sdt(void *arg, mpegts_psi_t *psi)
     SDT_SET_SECTION_NUMBER(mod->custom_sdt, 0);
     SDT_SET_LAST_SECTION_NUMBER(mod->custom_sdt, 0);
 
-    const uint16_t item_length = __SDT_ITEM_DESC_SIZE(pointer) + 5;
-    memcpy(&mod->custom_sdt->buffer[11], pointer, item_length);
-    const uint16_t section_length = item_length + 8 + CRC32_SIZE;
-    mod->custom_sdt->buffer_size = 3 + section_length;
+    const size_t original_item_length = __SDT_ITEM_DESC_SIZE(pointer) + 5;
+    /* DVB section_length <= 1021; 11 header bytes + 4 CRC bytes. */
+    const size_t max_item_length = 1024 - 11 - CRC32_SIZE;
+    const size_t item_length = sdt_catv_item(
+        &mod->custom_sdt->buffer[11], max_item_length,
+        pointer, original_item_length);
+    if(!item_length)
+    {
+        asc_log_error(MSG("SDT CATV provider rewrite failed"));
+        return;
+    }
+    const size_t section_length = item_length + 8 + CRC32_SIZE;
+    mod->custom_sdt->buffer_size = (uint16_t)(3 + section_length);
 
     if(mod->config.set_pnr)
     {
@@ -829,8 +867,7 @@ static void on_ts(module_data_t *mod, const uint8_t *ts)
             mpegts_psi_mux(mod->pmt, ts, on_pmt, mod);
             return;
         case MPEGTS_PACKET_SDT:
-            if(mod->config.pass_sdt)
-                break;
+            /* Always rewrite SDT provider, even with pass_sdt enabled. */
             mpegts_psi_mux(mod->sdt, ts, on_sdt, mod);
             return;
         case MPEGTS_PACKET_EIT:
