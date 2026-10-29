@@ -607,6 +607,74 @@ static void on_pmt(void *arg, mpegts_psi_t *psi)
  *
  */
 
+
+
+/*
+ * Build DVB service_descriptor (0x48).
+ *
+ * provider/name: UTF-8.
+ * service_type: original DVB service type.
+ *
+ * Returns descriptor size, or 0 on error.
+ */
+size_t make_service_descriptor(
+    uint8_t *dst,
+    size_t capacity,
+    uint8_t service_type,
+    const char *provider,
+    const char *name
+) {
+    if (!dst || !provider || !name)
+        return 0;
+
+    size_t provider_len = strlen(provider);
+    size_t name_len = strlen(name);
+
+    /*
+     * 0x15 marks UTF-8 in DVB text.
+     * Each DVB string includes this byte.
+     */
+    if (provider_len > 250 || name_len > 250)
+        return 0;
+
+    size_t p_len = provider_len + 1;
+    size_t n_len = name_len + 1;
+
+    /*
+     * service_type: 1 byte
+     * provider length: 1 byte
+     * provider text: p_len
+     * name length: 1 byte
+     * name text: n_len
+     */
+    size_t payload_len = 3 + p_len + n_len;
+    size_t total_len = 2 + payload_len;
+
+    if (payload_len > 255 || total_len > capacity)
+        return 0;
+
+    size_t pos = 0;
+
+    dst[pos++] = 0x48;
+    dst[pos++] = (uint8_t)payload_len;
+
+    dst[pos++] = service_type;
+
+    dst[pos++] = (uint8_t)p_len;
+    dst[pos++] = 0x15;
+
+    memcpy(dst + pos, provider, provider_len);
+    pos += provider_len;
+
+    dst[pos++] = (uint8_t)n_len;
+    dst[pos++] = 0x15;
+
+    memcpy(dst + pos, name, name_len);
+    pos += name_len;
+
+    return pos;
+}
+
 static void on_sdt(void *arg, mpegts_psi_t *psi)
 {
     module_data_t *mod = (module_data_t *)arg;
