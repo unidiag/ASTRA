@@ -561,7 +561,7 @@ bool http_parse_query(const char *str, size_t size, parse_match_t *match)
             ++skip;
     }
 
-    if(skip == 0 || skip >= size)
+    if(skip >= size)
     {
         match[1].eo = skip;
         match[2].so = skip;

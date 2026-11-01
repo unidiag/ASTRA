@@ -93,6 +93,10 @@ bool lua_parse_query(const char *str, size_t size)
             lua_settable(lua, -3);
         }
 
+        // A successful parser iteration must consume at least one byte.
+        if(m[0].eo == 0 || m[0].eo > size - skip)
+            return false;
+
         skip += m[0].eo;
     }
 
